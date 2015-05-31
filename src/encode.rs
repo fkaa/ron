@@ -1,339 +1,359 @@
+extern crate serde;
+
 use std::fmt;
-use rustc_serialize;
+use std::io;
 
+use std::string::FromUtf8Error;
 
-#[derive(Clone, Copy, Debug)]
-pub enum Error {
-    Format(fmt::Error),
-    Expectation(Expect),
-}
-
-impl From<fmt::Error> for Error {
-    fn from(err: fmt::Error) -> Error {
-        Error::Format(err)
-    }
-}
-
-enum Format<'a> {
-    Compact,
-    Pretty {
-        indent: &'a str,
-    },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Expect {
-    Constant,
-    Element,
-}
-
-struct State {
-    expect: Expect,
-    indent: u32,
-    start_line: bool,
-}
+use serde::ser;
 
 /// A structure for implementing serialization to RON.
-pub struct Encoder<'a> {
-    writer: &'a mut (fmt::Write+'a),
-    format : Format<'a>,
-    state: State,
+pub struct Encoder<W, F = CompactFormatter> {
+    writer: W,
+    formatter: F,
+    first_line: bool,
 }
 
-impl<'a> Encoder<'a> {
+impl<W> Encoder<W>
+    where W: io::Write,
+{
+    pub fn new(writer: W) -> Self {
+        Encoder::with_formatter(writer, CompactFormatter)
+    }
+}
+
+impl<'a, W> Encoder<W, PrettyFormatter<'a>>
+    where W: io::Write,
+{
+    pub fn pretty(writer: W) -> Self {
+        Encoder::with_formatter(writer, PrettyFormatter::new())
+    }
+}
+
+impl<W, F> Encoder<W, F>
+    where W: io::Write,
+          F: Formatter,
+{
     /// Creates a new encoder whose output will be written in compact
     /// RON to the specified writer
-    pub fn new(writer: &'a mut fmt::Write) -> Encoder<'a> {
+    pub fn with_formatter(writer: W, formatter: F) -> Encoder<W, F> {
         Encoder {
             writer: writer,
-            format: Format::Compact,
-            state: State {
-                expect: Expect::Element,
-                indent: 0,
-                start_line: false,
-            },
+            formatter: formatter,
+            first_line: false,
         }
     }
 
-    /// Creates a new encoder whose output will be written in pretty
-    /// RON to the specified writer
-    pub fn new_pretty(writer: &'a mut fmt::Write, indent: &'a str) -> Encoder<'a> {
-        Encoder {
-            writer: writer,
-            format: Format::Pretty {
-                indent: indent,
-            },
-            state: State {
-                expect: Expect::Element,
-                indent: 0,
-                start_line: false,
-            },
-        }
+    fn emit_constant<T: fmt::Display>(&mut self, v: T) -> io::Result<()> {
+        write!(self.writer, "{}", v)
     }
 
-    fn emit_constant<T: fmt::Display>(&mut self, v: T) -> Result<(), Error> {
-        match self.state.expect {
-            Expect::Element | Expect::Constant => {
-                try!(write!(self.writer, "{}", v));
-                Ok(())
-            },
-            //_ => Err(Error::Expectation(self.state.expect)),
-        }
+    fn emit_escape<T: fmt::Display>(&mut self, v: T, escape: char) -> io::Result<()> {
+        write!(self.writer, "{}{}{}", escape, v, escape)
     }
 
-    fn emit_escape<T: fmt::Display>(&mut self, v: T, escape: char) -> Result<(), Error> {
-        match self.state.expect {
-            Expect::Constant | Expect::Element => {
-                try!(write!(self.writer, "{}{}{}", escape, v, escape));
-                Ok(())
-            },
-            //_ => Err(Error::Expectation(self.state.expect)),
-        }
+}
+
+impl<W, F> ser::Serializer for Encoder<W, F>
+    where W: io::Write,
+          F: Formatter,
+{
+    type Error = io::Error;
+
+    fn visit_bool(&mut self, v: bool)    -> io::Result<()> { self.emit_constant(v) }
+
+    fn visit_usize(&mut self, v: usize)  -> io::Result<()> { self.emit_constant(v) }
+    fn visit_u64(&mut self, v: u64)      -> io::Result<()> { self.emit_constant(v) }
+    fn visit_u32(&mut self, v: u32)      -> io::Result<()> { self.emit_constant(v) }
+    fn visit_u16(&mut self, v: u16)      -> io::Result<()> { self.emit_constant(v) }
+    fn visit_u8(&mut self, v: u8)        -> io::Result<()> { self.emit_constant(v) }
+
+    fn visit_isize(&mut self, v: isize)  -> io::Result<()> { self.emit_constant(v) }
+    fn visit_i64(&mut self, v: i64)      -> io::Result<()> { self.emit_constant(v) }
+    fn visit_i32(&mut self, v: i32)      -> io::Result<()> { self.emit_constant(v) }
+    fn visit_i16(&mut self, v: i16)      -> io::Result<()> { self.emit_constant(v) }
+    fn visit_i8(&mut self, v: i8)        -> io::Result<()> { self.emit_constant(v) }
+
+    fn visit_f64(&mut self, v: f64)      -> io::Result<()> { self.emit_constant(v) }
+    fn visit_f32(&mut self, v: f32)      -> io::Result<()> { self.emit_constant(v) }
+
+    fn visit_char(&mut self, v: char)    -> io::Result<()> { self.emit_escape(v, '\'') }
+    fn visit_str(&mut self, v: &str)     -> io::Result<()> { self.emit_escape(v, '\"') }
+
+    fn visit_unit(&mut self) -> io::Result<()> {
+        self.writer.write_all(b"()")
     }
 
-    fn new_line(&mut self) -> Result<(), fmt::Error> {
-        if let Format::Pretty { indent } = self.format {
-            try!(write!(self.writer, "\n"));
-            for _ in 0 .. self.state.indent {
-                try!(write!(self.writer, "{}", indent));
+    fn visit_none(&mut self) -> io::Result<()> {
+        self.visit_unit()
+    }
+
+    fn visit_some<V>(&mut self, value: V) -> io::Result<()> 
+        where V: ser::Serialize
+    {
+        value.serialize(self)
+    }
+
+    fn visit_enum_unit(&mut self, name: &str, variant: &str) -> io::Result<()> {
+        self.emit_escape(name, '¶')
+    }
+
+    fn visit_seq<V>(&mut self, mut visitor: V) -> io::Result<()>
+        where V: ser::SeqVisitor,
+    {   
+        match visitor.len() {
+            Some(len) if len == 0 => {
+                self.writer.write_all(b"[]")
+            },
+            _ => {
+                try!(self.formatter.open(&mut self.writer, b'['));
+                self.first_line = true;
+
+                // TODO: maybe fix
+                try!(visitor.visit(self));
+ 
+                self.formatter.close(&mut self.writer, b']')
             }
         }
-        Ok(())
     }
 
-    fn get_space(&self) -> &'static str {
-        match self.format {
-            Format::Pretty{..} => " ",
-            Format::Compact => "",
+    fn visit_enum_seq<V>(&mut self, name: &str, variant: &str, visitor: V) -> io::Result<()>
+        where V: ser::SeqVisitor
+    {
+        try!(self.formatter.open(&mut self.writer, b'{'));
+        try!(self.formatter.comma(&mut self.writer, true));
+        try!(self.visit_str(variant));
+        try!(self.formatter.colon(&mut self.writer));
+        try!(self.visit_seq(visitor));
+        self.formatter.close(&mut self.writer, b'}')
+    }
+
+    fn visit_seq_elt<T>(&mut self, value: T) -> io::Result<()>
+        where T: ser::Serialize
+    {
+        try!(self.formatter.comma(&mut self.writer, self.first_line));
+        self.first_line = true;
+
+        value.serialize(self)
+    }
+
+    fn visit_map<V>(&mut self, mut visitor: V) -> io::Result<()>
+        where V: ser::MapVisitor,
+    {
+        match visitor.len() {
+            Some(len) if len == 0 => {
+                self.writer.write_all(b"{}")
+            }
+            _ => {
+                try!(self.formatter.open(&mut self.writer, b'{'));
+                self.first_line = true;
+
+                /*while let Some(()) = */try!(visitor.visit(self)); //{ }
+
+                self.formatter.close(&mut self.writer, b'}')
+            }
+        }
+    }
+
+    fn visit_enum_map<V>(&mut self, name: &str, variant: &str, visitor: V) -> io::Result<()>
+        where V: ser::MapVisitor,
+    {
+        try!(self.formatter.open(&mut self.writer, b'{'));
+        try!(self.formatter.comma(&mut self.writer, true));
+        try!(self.visit_str(variant));
+        try!(self.formatter.colon(&mut self.writer));
+        try!(self.visit_map(visitor));
+
+        self.formatter.close(&mut self.writer, b'}')
+    }
+
+    fn visit_map_elt<K, V>(&mut self, key: K, value: V) -> io::Result<()>
+        where K: ser::Serialize,
+              V: ser::Serialize,
+    {
+        try!(self.formatter.comma(&mut self.writer, self.first_line));
+        self.first_line = false;
+
+        try!(key.serialize(self));
+        try!(self.formatter.colon(&mut self.writer));
+        value.serialize(self)
+    }
+
+    fn format() -> &'static str {
+        "ron"
+    }
+
+}
+
+pub trait Formatter {
+    fn open<W>(&mut self, writer: &mut W, ch: u8) -> io::Result<()>
+        where W: io::Write;
+
+    fn comma<W>(&mut self, writer: &mut W, first: bool) -> io::Result<()>
+        where W: io::Write;
+
+    fn colon<W>(&mut self, writer: &mut W) -> io::Result<()>
+        where W: io::Write;
+
+    fn close<W>(&mut self, writer: &mut W, ch: u8) -> io::Result<()>
+        where W: io::Write;
+}
+
+pub struct CompactFormatter;
+
+impl Formatter for CompactFormatter {
+    fn open<W>(&mut self, writer: &mut W, ch: u8) -> io::Result<()>
+        where W: io::Write,
+    {
+        writer.write_all(&[ch])
+    }
+
+    fn comma<W>(&mut self, writer: &mut W, first: bool) -> io::Result<()>
+        where W: io::Write,
+    {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b",")
+        }
+    }
+
+    fn colon<W>(&mut self, writer: &mut W) -> io::Result<()>
+        where W: io::Write,
+    {
+        writer.write_all(b":")
+    }
+
+    fn close<W>(&mut self, writer: &mut W, ch: u8) -> io::Result<()>
+        where W: io::Write,
+    {
+        writer.write_all(&[ch])
+    }
+}
+
+pub struct PrettyFormatter<'a> {
+    current_indent: usize,
+    indent: &'a [u8],
+}
+
+impl<'a> PrettyFormatter<'a> {
+    fn new() -> Self {
+        PrettyFormatter::with_indent(b"  ")
+    }
+
+    fn with_indent(indent: &'a [u8]) -> Self {
+        PrettyFormatter {
+            current_indent: 0,
+            indent: indent,
         }
     }
 }
 
-impl<'a> rustc_serialize::Encoder for Encoder<'a> {
-    type Error = Error;
-
-    fn emit_nil(&mut self) -> Result<(), Error> {
-        match self.state.expect {
-            Expect::Element => {
-                try!(write!(self.writer, "()"));
-                Ok(())
-            },
-            _ => Err(Error::Expectation(self.state.expect)),
-        }
+impl<'a> Formatter for PrettyFormatter<'a> {
+    fn open<W>(&mut self, writer: &mut W, ch: u8) -> io::Result<()>
+        where W: io::Write,
+    {
+        self.current_indent += 1;
+        writer.write_all(&[ch])
     }
 
-    fn emit_usize(&mut self, v: usize)  -> Result<(), Error> { self.emit_constant(v) }
-    fn emit_u64(&mut self, v: u64)      -> Result<(), Error> { self.emit_constant(v) }
-    fn emit_u32(&mut self, v: u32)      -> Result<(), Error> { self.emit_constant(v) }
-    fn emit_u16(&mut self, v: u16)      -> Result<(), Error> { self.emit_constant(v) }
-    fn emit_u8(&mut self, v: u8)        -> Result<(), Error> { self.emit_constant(v) }
-
-    fn emit_isize(&mut self, v: isize)  -> Result<(), Error> { self.emit_constant(v) }
-    fn emit_i64(&mut self, v: i64)      -> Result<(), Error> { self.emit_constant(v) }
-    fn emit_i32(&mut self, v: i32)      -> Result<(), Error> { self.emit_constant(v) }
-    fn emit_i16(&mut self, v: i16)      -> Result<(), Error> { self.emit_constant(v) }
-    fn emit_i8(&mut self, v: i8)        -> Result<(), Error> { self.emit_constant(v) }
-
-    fn emit_bool(&mut self, v: bool)    -> Result<(), Error> { self.emit_constant(v) }
-    fn emit_f64(&mut self, v: f64)      -> Result<(), Error> { self.emit_constant(v) }
-    fn emit_f32(&mut self, v: f32)      -> Result<(), Error> { self.emit_constant(v) }
-
-    fn emit_char(&mut self, v: char)    -> Result<(), Error> { self.emit_escape(v, '\'') }
-    fn emit_str(&mut self, v: &str)     -> Result<(), Error> { self.emit_escape(v, '\"') }
-
-    fn emit_enum<F>(&mut self, _name: &str, f: F) -> Result<(), Error> where
-        F: FnOnce(&mut Encoder<'a>) -> Result<(), Error>,
+    fn comma<W>(&mut self, writer: &mut W, first: bool) -> io::Result<()>
+        where W: io::Write,
     {
-        if self.state.expect == Expect::Element {
-            f(self)
+        if first {
+            try!(writer.write_all(b"\n"));
         } else {
-            Err(Error::Expectation(self.state.expect))
+            try!(writer.write_all(b",\n"));
         }
+
+        indent(writer, self.current_indent, self.indent)
     }
 
-    fn emit_enum_variant<F>(&mut self, name: &str, _id: usize, cnt: usize, f: F)
-                         -> Result<(), Error> where
-        F: FnOnce(&mut Encoder<'a>) -> Result<(), Error>,
+    fn colon<W>(&mut self, writer: &mut W) -> io::Result<()>
+        where W: io::Write,
     {
-        self.emit_struct(name, cnt, f)
+        writer.write_all(b": ")
     }
 
-    fn emit_enum_variant_arg<F>(&mut self, idx: usize, f: F) -> Result<(), Error> where
-        F: FnOnce(&mut Encoder<'a>) -> Result<(), Error>,
+    fn close<W>(&mut self, writer: &mut W, ch: u8) -> io::Result<()>
+        where W: io::Write,
     {
-        self.emit_tuple_arg(idx, f)
+        self.current_indent -= 1;
+        try!(writer.write(b"\n"));
+        try!(indent(writer, self.current_indent, self.indent));
+
+        writer.write_all(&[ch])
+    }
+}
+
+fn indent<W>(wr: &mut W, n: usize, s: &[u8]) -> io::Result<()>
+    where W: io::Write,
+{
+    for _ in 0 .. n {
+        try!(wr.write_all(s));
     }
 
-    fn emit_enum_struct_variant<F>(&mut self, name: &str, _id: usize, _cnt: usize, f: F)
-                                -> Result<(), Error> where
-        F: FnOnce(&mut Encoder<'a>) -> Result<(), Error>,
-    {
-        try!(write!(self.writer, "{}{{", name));
-        self.state.indent += 1;
-        try!(f(self));
-        self.state.indent -= 1;
-        try!(self.new_line());
-        try!(write!(self.writer, "}}"));
-        Ok(())
-    }
+    Ok(())
+}
 
-    fn emit_enum_struct_variant_field<F>(&mut self, name: &str, idx: usize, f: F)
-                                      -> Result<(), Error> where
-        F: FnOnce(&mut Encoder<'a>) -> Result<(), Error>,
-    {
-        self.emit_struct_field(name, idx, f)
-    }
+#[inline]
+pub fn to_writer<W, T>(writer: &mut W, value: &T) -> io::Result<()>
+    where W: io::Write,
+          T: ser::Serialize,
+{
+    let mut enc = Encoder::new(writer);
+    try!(value.serialize(&mut enc));
+    Ok(())
+}
 
-    fn emit_struct<F>(&mut self, name: &str, len: usize, f: F) -> Result<(), Error> where
-        F: FnOnce(&mut Encoder<'a>) -> Result<(), Error>,
-    {
-        if self.state.expect != Expect::Element {
-            return Err(Error::Expectation(self.state.expect))
-        }
-        if len == 0 {
-            try!(write!(self.writer, "{}", name));
-        } else {
-            try!(write!(self.writer, "{}(", name));
-            if len > 1 {
-                self.state.start_line = true;
-                self.state.indent += 1;
-                try!(f(self));
-                self.state.indent -= 1;
-                try!(self.new_line());
-            } else {
-                self.state.start_line = false;
-                try!(f(self));
-            }
-            try!(write!(self.writer, ")"));
-        }
-        Ok(())
-    }
+#[inline]
+pub fn to_writer_pretty<W, T>(writer: &mut W, value: &T) -> io::Result<()>
+    where W: io::Write,
+          T: ser::Serialize,
+{
+    let mut enc = Encoder::pretty(writer);
+    try!(value.serialize(&mut enc));
+    Ok(())
+}
 
-    fn emit_struct_field<F>(&mut self, name: &str, _idx: usize, f: F) -> Result<(), Error> where
-        F: FnOnce(&mut Encoder<'a>) -> Result<(), Error>,
-    {
-        try!(self.new_line());
-        let space = self.get_space();
-        try!(write!(self.writer, "{}:{}", name, space));
-        try!(f(self));
-        try!(write!(self.writer, ","));
-        Ok(())
-    }
+/// Encode the specified struct into a json `[u8]` buffer.
+#[inline]
+pub fn to_vec<T>(value: &T) -> Vec<u8>
+    where T: ser::Serialize,
+{
+    // We are writing to a Vec, which doesn't fail. So we can ignore
+    // the error.
+    let mut writer = Vec::with_capacity(128);
+    to_writer(&mut writer, value).unwrap();
+    writer
+}
 
-    fn emit_tuple<F>(&mut self, len: usize, f: F) -> Result<(), Error> where
-        F: FnOnce(&mut Encoder<'a>) -> Result<(), Error>,
-    {
-        self.emit_struct("", len, f)
-    }
+/// Encode the specified struct into a json `[u8]` buffer.
+#[inline]
+pub fn to_vec_pretty<T>(value: &T) -> Vec<u8>
+    where T: ser::Serialize,
+{
+    // We are writing to a Vec, which doesn't fail. So we can ignore
+    // the error.
+    let mut writer = Vec::with_capacity(128);
+    to_writer_pretty(&mut writer, value).unwrap();
+    writer
+}
 
-    fn emit_tuple_arg<F>(&mut self, _idx: usize, f: F) -> Result<(), Error> where
-        F: FnOnce(&mut Encoder<'a>) -> Result<(), Error>,
-    {
-        if self.state.start_line {
-            try!(self.new_line());
-            try!(f(self));
-            try!(write!(self.writer, ","));
-            Ok(())
-        } else {
-            f(self)
-        }
-    }
+/// Encode the specified struct into a json `String` buffer.
+#[inline]
+pub fn to_string<T>(value: &T) -> Result<String, FromUtf8Error>
+    where T: ser::Serialize
+{
+    let vec = to_vec(value);
+    String::from_utf8(vec)
+}
 
-    fn emit_tuple_struct<F>(&mut self, name: &str, len: usize, f: F) -> Result<(), Error> where
-        F: FnOnce(&mut Encoder<'a>) -> Result<(), Error>,
-    {
-        self.emit_struct(name, len, f)
-    }
-
-    fn emit_tuple_struct_arg<F>(&mut self, idx: usize, f: F) -> Result<(), Error> where
-        F: FnOnce(&mut Encoder<'a>) -> Result<(), Error>,
-    {
-        self.emit_tuple_arg(idx, f)
-    }
-
-    fn emit_option<F>(&mut self, f: F) -> Result<(), Error> where
-        F: FnOnce(&mut Encoder<'a>) -> Result<(), Error>,
-    {
-        self.emit_enum("", f)
-    }
-
-    fn emit_option_none(&mut self) -> Result<(), Error> {
-        try!(write!(self.writer, "None"));
-        Ok(())
-    }
-
-    fn emit_option_some<F>(&mut self, f: F) -> Result<(), Error> where
-        F: FnOnce(&mut Encoder<'a>) -> Result<(), Error>,
-    {
-        self.emit_struct("Some", 1, f)
-    }
-
-    fn emit_seq<F>(&mut self, len: usize, f: F) -> Result<(), Error> where
-        F: FnOnce(&mut Encoder<'a>) -> Result<(), Error>,
-    {
-        if self.state.expect != Expect::Element {
-            return Err(Error::Expectation(self.state.expect))
-        }
-        if len == 0 {
-            try!(write!(self.writer, "[]"));
-        } else {
-            self.state.start_line = true;
-            try!(write!(self.writer, "["));
-            self.state.indent += 1;
-            try!(f(self));
-            self.state.indent -= 1;
-            try!(self.new_line());
-            try!(write!(self.writer, "]"));
-        }
-        Ok(())
-    }
-
-    fn emit_seq_elt<F>(&mut self, idx: usize, f: F) -> Result<(), Error> where
-        F: FnOnce(&mut Encoder<'a>) -> Result<(), Error>,
-    {
-        self.emit_tuple_arg(idx, f)
-    }
-
-    fn emit_map<F>(&mut self, len: usize, f: F) -> Result<(), Error> where
-        F: FnOnce(&mut Encoder<'a>) -> Result<(), Error>,
-    {
-        if self.state.expect != Expect::Element {
-            return Err(Error::Expectation(self.state.expect))
-        }
-        if len == 0 {
-            try!(write!(self.writer, "{{}}"));
-        } else {
-            try!(write!(self.writer, "{{"));
-            self.state.indent += 1;
-            try!(f(self));
-            self.state.indent -= 1;
-            try!(self.new_line());
-            try!(write!(self.writer, "}}"));
-        }
-        Ok(())
-    }
-
-    fn emit_map_elt_key<F>(&mut self, _idx: usize, f: F) -> Result<(), Error> where
-        F: FnOnce(&mut Encoder<'a>) -> Result<(), Error>,
-    {
-        try!(self.new_line());
-        let expect = self.state.expect;
-        self.state.expect = Expect::Constant;
-        try!(f(self));
-        try!(write!(self.writer, ","));
-        self.state.expect = expect;
-        Ok(())
-    }
-
-    fn emit_map_elt_val<F>(&mut self, _idx: usize, f: F) -> Result<(), Error> where
-        F: FnOnce(&mut Encoder<'a>) -> Result<(), Error>,
-    {
-        let space = self.get_space();
-        try!(write!(self.writer, ":{}", space));
-        let expect = self.state.expect;
-        self.state.expect = Expect::Element;
-        try!(f(self));
-        self.state.expect = expect;
-        Ok(())
-    }
+/// Encode the specified struct into a json `String` buffer.
+#[inline]
+pub fn to_string_pretty<T>(value: &T) -> Result<String, FromUtf8Error>
+    where T: ser::Serialize
+{
+    let vec = to_vec_pretty(value);
+    String::from_utf8(vec)
 }

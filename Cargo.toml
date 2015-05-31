@@ -10,8 +10,6 @@ authors = [
 [lib]
 name = "ron"
 
-[[example]]
-name = "encode"
-
 [dependencies]
-rustc-serialize = "*"
+serde = "*"
+serde_macros = "*"
